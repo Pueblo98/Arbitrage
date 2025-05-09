@@ -4,106 +4,143 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-# === 0. Parameters ===
-WINDOW             = 90          # look‐back window
-Z_THRESH           = 2.0         # z‐score threshold
-TOTAL_CAPITAL      = 1e6         # USD
-RISK_PER_TRADE_PCT = 0.02        # 2% of capital per trade
-FEE_RATE           = 0.0005      # 0.05% per side
-SLIPPAGE_RATE      = 0.001       # 0.10% per side
-VAR_CONFIDENCE     = 0.95        # 95% VaR
+# ========== PARAMETERS ==========
+WINDOW   = 30
+Z_THRESH = 1.5
+CAPITAL  = 1_000_000      # USD total capital
+RISK_PC  = 0.02           # 2 % of capital per trade
+FEE_RT   = 0.0005         # 0.05 % per side
+SLIP_RT  = 0.001          # 0.10 % per side
+VAR_P    = 0.95           # 95 % VaR
+np.random.seed(42)        # repeatable randomness
 
-# === 1. Load Data ===
-df = pd.read_csv("Aligned_BTC_GSR.csv", parse_dates=["Date"])
-df = df.sort_values("Date").set_index("Date")
+# ========== LOAD DATA ==========
+df = (pd.read_csv("Aligned_BTC_GSR.csv", parse_dates=["Date"])
+        .sort_values("Date")
+        .set_index("Date"))
 
-# === 2. Compute Returns & GSR Changes ===
+# returns & GSR changes
 df["r_btc"] = np.log(df["Close"] / df["Close"].shift(1))
 df["d_gsr"] = df["GSR"].pct_change()
 df = df.dropna(subset=["r_btc", "d_gsr"])
 
-# === 3. Initialize Columns ===
-for col in ["alpha","beta","resid","mu","sd","z","signal","position"]:
-    df[col] = np.nan
-df["signal"]   = 0
-df["position"] = 0
+# helper columns
+for col in ["alpha","beta","resid","mu","sd","z",
+            "signal","position"]:
+    df[col] = 0.0
 
-# === 4. Rolling Regression & Signals ===
-for t in range(WINDOW, len(df)-1):
-    win = df.iloc[t-WINDOW:t]
-    Y, X = win["r_btc"], sm.add_constant(win["d_gsr"])
-    model = sm.OLS(Y, X).fit()
-    
-    a, b = model.params
-    df.at[df.index[t], "alpha"] = a
-    df.at[df.index[t], "beta"]  = b
-    
-    resid = Y - model.predict(X)
-    mu, sd = resid.mean(), resid.std()
-    df.at[df.index[t], "mu"] = mu
-    df.at[df.index[t], "sd"] = sd
-    
+# ========== ROLLING REGRESSION & STRATEGY SIGNALS ==========
+for t in range(WINDOW, len(df) - 1):
+    win   = df.iloc[t-WINDOW:t]
+    model = sm.OLS(win["r_btc"], sm.add_constant(win["d_gsr"])).fit()
+    a, b  = model.params
+
+    resid_series = win["r_btc"] - model.predict(sm.add_constant(win["d_gsr"]))
+    mu, sd       = resid_series.mean(), resid_series.std()
+
     eps = df["r_btc"].iat[t] - (a + b * df["d_gsr"].iat[t])
-    z   = (eps - mu) / sd
-    df.at[df.index[t], "resid"] = eps
-    df.at[df.index[t], "z"]     = z
-    
+    z   = (eps - mu) / sd if sd > 0 else 0.0
+
+    df.iloc[t, df.columns.get_loc("alpha")] = a
+    df.iloc[t, df.columns.get_loc("beta")]  = b
+    df.iloc[t, df.columns.get_loc("mu")]    = mu
+    df.iloc[t, df.columns.get_loc("sd")]    = sd
+    df.iloc[t, df.columns.get_loc("resid")] = eps
+    df.iloc[t, df.columns.get_loc("z")]     = z
+
     sig = 1 if z < -Z_THRESH else (-1 if z > Z_THRESH else 0)
-    df.at[df.index[t],   "signal"]   = sig
-    df.at[df.index[t+1], "position"] = sig
+    df.iloc[t,   df.columns.get_loc("signal")]   = sig
+    df.iloc[t+1, df.columns.get_loc("position")] = sig
 
-# === 5. Volatility‐Scaled Position Sizing ===
-risk_per_trade = TOTAL_CAPITAL * RISK_PER_TRADE_PCT
-df["pos_size"] = risk_per_trade / df["sd"]
-# clean up any NaN or infinite
-df["pos_size"] = df["pos_size"].fillna(0).replace([np.inf, -np.inf], 0)
+# ========== RANDOM-WALK BENCHMARK (THRESHOLD-AWARE) ==========
+rand_pos = []
+current  = 0.0
+for z in df["z"]:
+    if abs(z) > Z_THRESH and current == 0.0:
+        # entry: pick random leverage in (-2, +2)
+        current = np.random.uniform(-2, 2)
+    elif abs(z) <= Z_THRESH and current != 0.0:
+        # exit when back inside band
+        current = 0.0
+    rand_pos.append(current)
+df["rand_position"] = rand_pos
 
-# === 6. Raw PnL (residual‐units) ===
+# ========== RESIDUAL SHIFT ==========
 df["resid_shift"] = df["resid"].shift(1).fillna(0)
-df["pnl_units"]  = df["position"] * (df["resid"] - df["resid_shift"])
-df["pnl_units"]  = df["pnl_units"].fillna(0)
 
-# === 7. Fees & Slippage ===
+# ========== VOL-SCALED NOTIONAL ==========
+risk_per_trade = CAPITAL * RISK_PC
+df["pos_size"] = (risk_per_trade / df["sd"]).replace([np.inf, -np.inf], 0).fillna(0)
+
+# ========== STRATEGY PnL ==========
+df["pnl_units"] = df["position"] * (df["resid"] - df["resid_shift"])
+df["pnl_units"] = df["pnl_units"].fillna(0)
 df["pos_usd"]        = df["position"] * df["pos_size"]
 df["trade_notional"] = df["pos_usd"].diff().abs().fillna(0)
-df["fees"]           = df["trade_notional"] * FEE_RATE
-df["slippage"]       = df["trade_notional"] * SLIPPAGE_RATE
-
-# === 8. Net PnL in USD ===
+df["fees"]           = df["trade_notional"] * FEE_RT
+df["slippage"]       = df["trade_notional"] * SLIP_RT
 df["pnl_$"]     = df["pnl_units"] * df["pos_size"] - df["fees"] - df["slippage"]
-df["pnl_$"]     = df["pnl_$"].fillna(0)
 df["cum_pnl_$"] = df["pnl_$"].cumsum()
 
-# === 9. Performance Metrics ===
-daily_ret  = df["pnl_$"] / TOTAL_CAPITAL
-mean_ret   = daily_ret.mean()
-std_ret    = daily_ret.std(ddof=1)
-sharpe_net = mean_ret / std_ret * np.sqrt(252)
+# ========== RANDOM-WALK PnL ==========
+df["rand_pnl_units"] = df["rand_position"] * (df["resid"] - df["resid_shift"])
 
-running_max  = df["cum_pnl_$"].cummax()
-drawdown     = df["cum_pnl_$"] - running_max
-max_drawdown = drawdown.min()
+df["rand_pos_usd"]        = df["rand_position"] * df["pos_size"]
+df["rand_trade_notional"] = df["rand_pos_usd"].diff().abs().fillna(0)
+df["rand_fees"]           = df["rand_trade_notional"] * FEE_RT
+df["rand_slippage"]       = df["rand_trade_notional"] * SLIP_RT
 
-var_dollar = -np.percentile(df["pnl_$"], (1 - VAR_CONFIDENCE) * 100)
-var_pct    = -np.percentile(daily_ret,    (1 - VAR_CONFIDENCE) * 100)
+df["rand_pnl_$"]     = (df["rand_pnl_units"] * df["pos_size"]
+                        - df["rand_fees"] - df["rand_slippage"])
+df["rand_pnl_$"]     = df["rand_pnl_$"].fillna(0)
+df["rand_cum_pnl_$"] = df["rand_pnl_$"].cumsum()
 
-total_pnl  = df["cum_pnl_$"].iloc[-1]
-return_pct = total_pnl / TOTAL_CAPITAL * 100
+# ========== METRICS ==========
+tot_strat = df["cum_pnl_$"].iloc[-1]
+tot_rand  = df["rand_cum_pnl_$"].iloc[-1]
 
-print(f"[{datetime.now().date()}] Net Total PnL        = ${total_pnl:,.2f}")
-print(f"Net Return              = {return_pct:.2f}%")
-print(f"Annualized Sharpe (net) = {sharpe_net:.2f}")
-print(f"Max Drawdown            = ${max_drawdown:,.2f}")
-print(f"{int(VAR_CONFIDENCE*100)}% VaR (dollar)        = ${var_dollar:,.2f}")
-print(f"{int(VAR_CONFIDENCE*100)}% VaR (percent)       = {var_pct:.2%}")
+print(f"[{datetime.now().date()}] Strategy PnL = ${tot_strat:,.2f}")
+print(f"[{datetime.now().date()}] Random Walk PnL = ${tot_rand:,.2f}")
 
-# === 10. Plots ===
-plt.figure(figsize=(10,4))
-plt.plot(df.index, df["cum_pnl_$"], label="Cumulative Net PnL")
-plt.title(f"Cumulative Net PnL — {WINDOW}-Day Rolling | Threshold ±{Z_THRESH}")
-plt.ylabel("USD"); plt.legend(); plt.tight_layout(); plt.show()
+# ========== PERFORMANCE METRICS (strategy & random walk) ==========
 
-plt.figure(figsize=(10,4))
-plt.fill_between(df.index, drawdown, 0, color="red")
-plt.title("Underwater Curve (Drawdowns)")
-plt.ylabel("Drawdown (USD)"); plt.tight_layout(); plt.show()
+def perf(cum_pnl_series, daily_pnl_series, capital, label=""):
+    """Return a dict of performance stats for the given PnL series."""
+    daily_ret = daily_pnl_series / capital
+    ann_ret   = daily_ret.mean() * 252
+    ann_vol   = daily_ret.std(ddof=1) * np.sqrt(252)
+    sharpe    = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    running_max = cum_pnl_series.cummax()
+    max_dd      = (cum_pnl_series - running_max).min()     # USD
+
+    var_95_pct  = -np.percentile(daily_ret, 5) * 100       # percentage VaR
+
+    return {
+        "Label"      : label,
+        "Total PnL $"   : cum_pnl_series.iloc[-1],
+        "Return  %"     : 100 * cum_pnl_series.iloc[-1] / capital,
+        "Sharpe (ann.)" : sharpe,
+        "Max DD  $"     : max_dd,
+        "95% VaR %"     : var_95_pct,
+    }
+
+strat_stats = perf(df["cum_pnl_$"], df["pnl_$"],  CAPITAL, "Strategy")
+rand_stats  = perf(df["rand_cum_pnl_$"], df["rand_pnl_$"], CAPITAL, "Random walk")
+
+# pretty‐print
+for s in (strat_stats, rand_stats):
+    print(f"\n=== {s['Label']} ===")
+    for k, v in s.items():
+        if k == "Label": continue
+        print(f"{k:>15}: {v:,.2f}")
+
+# ========== PLOT ==========
+plt.figure(figsize=(10,5))
+plt.plot(df.index, df["cum_pnl_$"],      label="Strategy")
+plt.plot(df.index, df["rand_cum_pnl_$"], label="Random Walk (±2 random dir)", linestyle="--")
+plt.title("Cumulative Net PnL: Strategy vs. Threshold-Aware Random Walk")
+plt.ylabel("USD")
+plt.legend()
+plt.tight_layout()
+plt.show()
